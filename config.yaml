@@ -1,0 +1,207 @@
+# UR10e PPO Stable-Baselines3 Configuration
+# Pure RL Control with Incremental Torque Approach
+
+# Environment settings - 内存优化配置
+env:
+  max_steps: 250              # 减少最大步数，降低内存使用
+  dt: 0.02                    # 增大时间步长，减少计算频率
+  device_id: 0                # GPU device ID (use GPU 2 for server)
+  num_envs: 2                # 环境模式
+
+# Control configuration (纯RL控制 - 方案A)
+control:
+  max_increment_torque: 20.0  # Maximum incremental torque per step (N⋅m)
+  torque_safety_factor: 0.8   # Safety factor for torque limits (80% of official)
+  velocity_safety_factor: 0.8 # Safety factor for velocity limits (80% of official)
+  control_frequency: 100      # Hz
+
+  # 🆕 Advanced control parameters for momentum inhibition
+  torque_momentum_decay: 0.95     # 动量衰减系数 (0.9-0.99), 防止力矩无限累积
+  velocity_penalty_strength: 10.0 # 速度惩罚强度 (5-20), 高速时减少力矩输出
+
+# Safety and collision detection
+safety:
+  emergency_stop_threshold: 0.5  # Emergency stop trigger (m)
+  collision_threshold: 0.1       # Collision detection threshold (m)
+  joint_position_limits: on      # Enforce joint position limits
+  torque_limits: on             # Enforce torque limits
+
+# 🎯 State normalization configuration
+state_normalization:
+  enabled: true                 # Enable/disable state normalization
+  target_position_range:        # Target position normalization range
+    x: [-1.0, 1.0]             # X axis range (meters)
+    y: [-1.0, 1.0]             # Y axis range (meters)
+    z: [0.0, 1.5]              # Z axis range (meters)
+  tcp_position_range:           # TCP position normalization range
+    x: [-1.2, 1.2]             # X axis range (meters)
+    y: [-1.2, 1.2]             # Y axis range (meters)
+    z: [0.0, 1.8]              # Z axis range (meters)
+
+# 🎯 Reward normalization configuration
+reward_normalization:
+  enabled: true                 # Enable/disable reward normalization
+  gamma: 0.99                   # Discount factor for return calculations
+  clip_range: 5.0              # Normalization clipping range
+  normalize_method: 'running_stats'  # Method: 'running_stats', 'batch_stats', 'rank'
+  warmup_steps: 100            # Steps before normalization starts
+
+# Reward function configuration (适配纯RL控制)
+reward:
+  # Distance-based reward (linear penalty)
+  distance_weight: 2.0          # Weight for distance penalty
+
+  # Success reward
+  success_reward: 10.0          # Reward for reaching target
+  success_threshold: 0.01       # Success distance threshold (5cm)
+
+  # Progress reward
+  progress_weight: 3.0          # Weight for making progress towards target
+
+  # Stability and efficiency
+  stability_weight: 0.3         # Weight for torque magnitude penalty
+  energy_weight: 0.01          # Weight for energy consumption
+
+  # Additional shaping
+  time_penalty: 0.01           # Small penalty per step to encourage efficiency
+  joint_limit_penalty: 1.0     # Penalty for approaching joint limits
+
+# Target configuration
+target:
+  range:
+    x: [-0.6, 0.6]             # X-axis range (meters)
+    y: [-0.6, 0.6]             # Y-axis range (meters)
+    z: [0.1, 0.8]              # Z-axis range (meters)
+  # Avoid unreachable configurations
+  min_reachability: 0.1        # Minimum reachability margin
+
+# Isaac Gym simulator configuration
+simulator:
+  use_gpu: false                # Use GPU acceleration
+  use_gpu_pipeline: false      # Disable GPU pipeline to avoid CUDA memory issues
+  graphics_device_id: -1        # Graphics device (0 for visualization)
+
+# Graphics and visualization
+graphics:
+  graphics_device_id: 0        # Graphics device ID for visualization
+
+visualization:
+  enable: false                 # Enable visualization during training
+  render_freq: 1               # Render every step
+
+  # PhysX parameters
+  solver_type: 1               # Solver type (1 = TGS)
+  num_position_iterations: 4   # Position solver iterations
+  num_velocity_iterations: 1   # Velocity solver iterations
+  substeps: 2                  # Simulation substeps
+
+  # Physics parameters
+  gravity: -9.81               # Gravity (m/s²)
+
+# Stable-Baselines3 PPO Configuration
+ppo:
+  # Network architecture
+  policy: "MlpPolicy"          # Policy network type
+  policy_kwargs:
+    net_arch: [512, 256, 128]  # Hidden layer sizes
+    activation_fn: "relu"      # Activation function
+    ortho_init: true           # Use orthogonal initialization
+    log_std_init: -0.5         # Initial log standard deviation for actions
+
+  # Learning parameters (optimized for pure RL control)
+  learning_rate: 3.0e-5        # Learning rate for both networks
+  n_steps: 2048                # Steps per update
+  batch_size: 64               # Batch size for training
+  n_epochs: 10                 # Number of optimization epochs per update
+  target_kl: 0.02              # Target KL divergence for early stopping
+
+  # PPO-specific parameters
+  gamma: 0.99                 # Discount factor
+  gae_lambda: 0.95             # GAE lambda parameter
+  clip_range: 0.1              # PPO clipping parameter
+  clip_range_vf: null          # Separate clipping for value function
+  normalize_advantage: true    # Normalize advantages
+  ent_coef: 0.01               # Entropy coefficient for exploration
+  vf_coef: 0.5                 # Value function coefficient
+  max_grad_norm: 0.5           # Gradient clipping
+
+  # Training configuration
+  total_timesteps: 2000000     # Total training timesteps
+  tensorboard_log: "./logs/"   # TensorBoard log directory
+
+  # Evaluation
+  eval_freq: 10000             # Evaluation frequency
+  n_eval_episodes: 10          # Number of evaluation episodes
+
+# Device configuration (for server compatibility)
+device:
+  # PyTorch device
+  pytorch_device: "cuda:0"
+
+  # Isaac Gym device
+  isaac_gym_device_id: 0
+
+  # Environment variables for consistency
+  cuda_visible_devices: "0"
+  pytorch_cuda_alloc_conf: "max_split_size_mb:128"
+
+# Training monitoring
+logging:
+  log_level: "INFO"
+  log_interval: 10             # Log every N updates
+  save_freq: 5000            # Save model every N timesteps
+
+  # Performance tracking
+  track_success_rate: true
+  track_reward_progress: true
+  track_torque_usage: true
+  track_distance_progress: true
+
+# Task-Space Configuration (3D Cartesian planning)
+task_space:
+  workspace_bounds:
+    x: [-0.8, 0.8]    # X-axis workspace range (meters)
+    y: [-0.8, 0.8]    # Y-axis workspace range (meters)
+    z: [0.1, 1.0]     # Z-axis workspace range (meters, floor considered)
+
+# Trajectory Tracking Configuration (Task-Space RRT* + RL)
+trajectory_tracking:
+  mode: "point_to_point"  # "point_to_point" 或 "trajectory_tracking"
+  waypoint_threshold: 0.05    # Waypoint到达阈值 (meters)
+  waypoint_bonus: 5.0         # 到达waypoint奖励
+  smooth_coef: 0.1            # 平滑性系数 (action penalty)
+  use_deviation_penalty: false # 是否使用路径偏离惩罚 (复杂，默认关闭)
+  deviation_coef: 2.0         # 路径偏离惩罚系数
+
+# Task-Space RRT* Parameters
+ts_rrt_star:
+  max_iterations: 2000         # 最大规划迭代
+  step_size: 0.05              # RRT*步长 (meters)
+  goal_bias: 0.1               # 目标采样偏置
+  rewire_radius: 0.15          # 重新布线半径 (meters)
+  max_waypoints: 50            # 最大路径点数量
+  replanning_threshold: 0.1    # 重新规划阈值 (meters)
+
+# RRT* Global Planning Integration (legacy)
+global_planning:
+  enabled: false              # Enable RRT* integration
+  planner_type: "rrt_star"    # Planning algorithm
+
+  # RRT* parameters
+  max_planning_time: 5.0      # Maximum planning time (seconds)
+  step_size: 0.05             # RRT step size (meters)
+  goal_bias: 0.1              # Goal sampling bias
+
+  # Integration parameters
+  waypoint_spacing: 0.1       # Distance between waypoints (meters)
+  local_planning_horizon: 0.5 # Local RL planning horizon (meters)
+
+# Debug and development
+debug:
+  render_during_training: false  # Enable rendering during training
+  save_simulation_states: false  # Save simulation states for debugging
+  verbose_logging: false         # Enable verbose logging
+
+  # Test and validation
+  test_mode: false               # Enable test mode
+  validate_gradients: false      # Validate gradients during training
