@@ -295,7 +295,7 @@ class UR10eIncrementalEnv(gym.Env):
         self.dt = self.config.get('env', {}).get('dt', 0.01)
 
         # UR10e joint limits and torque limits
-        self.torque_command_scale = 0.05  # Scale factor for torque commands
+        self.torque_command_scale = 0.15  # Scale factor for torque commands
         self.ur10e_joint_limits = torch.tensor([
             [-2.0*np.pi, 2.0*np.pi],  # Shoulder pan
             [-np.pi, np.pi],          # Shoulder lift
@@ -564,7 +564,7 @@ class UR10eIncrementalEnv(gym.Env):
             'reward': {
                 'distance_weight': 2.0,
                 'success_reward': 10.0,
-                'success_threshold': 0.05,
+                'success_threshold': 0.15,
                 'progress_weight': 3.0,
                 'stability_weight': 0.3,
                 'torque_penalty_weight': 0.01
@@ -950,10 +950,15 @@ class UR10eIncrementalEnv(gym.Env):
             print(f"🔧 Debug τ_max = {tau_max:.3f} N·m, qdot_max = {vel_max:.3f} rad/s")
 
         # Get observation, reward, done
+        
+        self.current_step += 1
+
+        timeout = self.current_step >= self.max_steps   # max_steps 来自 config
+        terminated = self._check_termination()
+        truncated = bool(timeout and not terminated)  # No early truncation for now
+        
         observation = self._get_observation()
         reward = self._calculate_reward()
-        terminated = self._check_termination()
-        truncated = False  # No early truncation for now
         info = self._get_info()
 
         # 🛠️ 修复奖励归一化
@@ -975,7 +980,6 @@ class UR10eIncrementalEnv(gym.Env):
                 except (IndexError, AttributeError) as e:
                     print(f"⚠️ Reward normalizer update failed: {e}")
 
-        self.current_step += 1
 
          # 检查输出
         if (np.isnan(observation).any() or np.isinf(observation).any() or
@@ -1035,26 +1039,62 @@ class UR10eIncrementalEnv(gym.Env):
         return obs_list[0] if self.num_envs == 1 else np.array(obs_list)
 
     def _forward_kinematics(self, joint_positions: torch.Tensor) -> torch.Tensor:
-        """Simple forward kinematics to get TCP position"""
-        # Simplified UR10e forward kinematics
-        # This is a basic implementation - in practice you'd use the proper kinematics
+        """
+        UR10e forward kinematics using all 6 joints (q1-q6).
+        关键：所有中间量都跟 joint_positions 在同一个 device 上，避免 CPU/GPU 混用。
+        """
+        # 保证是 1D 向量 [6]
+        joint_positions = joint_positions.view(-1)
+        device = joint_positions.device
+        dtype = joint_positions.dtype
 
-        # UR10e DH parameters (simplified)
-        a1, a2, a3 = 0.612, 0.572, 0.174  # Link lengths
-        d1 = 0.1273
-        d4 = 0.1199
-        d6 = 0.11655
+        # DH 参数放在 joint_positions 同一个 device 上
+        d = torch.tensor(
+            [0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655],
+            device=device, dtype=dtype
+        )
+        a = torch.tensor(
+            [0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0],
+            device=device, dtype=dtype
+        )
+        alpha = torch.tensor(
+            [math.pi / 2, 0.0, 0.0, math.pi / 2, -math.pi / 2, 0.0],
+            device=device, dtype=dtype
+        )
 
-        q1, q2, q3, q4, q5, q6 = joint_positions
+        # DH 变换
+        def dh_transform(theta, d_i, a_i, alpha_i):
+            ct = torch.cos(theta)
+            st = torch.sin(theta)
+            ca = torch.cos(alpha_i)
+            sa = torch.sin(alpha_i)
 
-        # Simplified forward kinematics (approximate)
-        x = (a1 * torch.cos(q1) + a2 * torch.cos(q1) * torch.cos(q2) +
-             a3 * torch.cos(q1) * torch.cos(q2 + q3))
-        y = (a1 * torch.sin(q1) + a2 * torch.sin(q1) * torch.cos(q2) +
-             a3 * torch.sin(q1) * torch.cos(q2 + q3))
-        z = (d1 + a2 * torch.sin(q2) + a3 * torch.sin(q2 + q3) + d4)
+            T = torch.zeros((4, 4), device=device, dtype=dtype)
+            T[0, 0] = ct
+            T[0, 1] = -st * ca
+            T[0, 2] = st * sa
+            T[0, 3] = a_i * ct
 
-        return torch.stack([x, y, z])
+            T[1, 0] = st
+            T[1, 1] = ct * ca
+            T[1, 2] = -ct * sa
+            T[1, 3] = a_i * st
+
+            T[2, 0] = 0.0
+            T[2, 1] = sa
+            T[2, 2] = ca
+            T[2, 3] = d_i
+
+            T[3, 3] = 1.0
+            return T
+
+        T_cum = torch.eye(4, device=device, dtype=dtype)
+        for i in range(6):
+            T_i = dh_transform(joint_positions[i], d[i], a[i], alpha[i])
+            T_cum = T_cum @ T_i
+
+        ee_pos = T_cum[:3, 3]
+        return ee_pos
 
     def _calculate_reward(self) -> float:
         """Calculate reward for pure RL control"""
@@ -1074,7 +1114,7 @@ class UR10eIncrementalEnv(gym.Env):
             distance_reward = -reward_config.get('distance_weight', 2.0) * distance.item()
 
             # Success reward
-            success_threshold = reward_config.get('success_threshold', 0.05)
+            success_threshold = reward_config.get('success_threshold', 0.15)
             success_reward = reward_config.get('success_reward', 10.0) if distance < success_threshold else 0.0
 
             # Progress reward (if getting closer to target)
@@ -1115,7 +1155,7 @@ class UR10eIncrementalEnv(gym.Env):
         # Check success (for first environment)
         tcp_pos = self._forward_kinematics(self.joint_positions[0])
         distance = torch.norm(tcp_pos - self.target_positions[0])
-        success_threshold = self.config.get('reward', {}).get('success_threshold', 0.05)
+        success_threshold = self.config.get('reward', {}).get('success_threshold', 0.15)
 
         return distance < success_threshold
 

@@ -400,7 +400,7 @@ def train_trajectory_tracker(config_path: str = "config.yaml"):
     _setup_environment_variables(config)
     log_dir, tensorboard_log = _setup_logging(config)
 
-    num_envs = config.get('env', {}).get('num_envs', 1)
+    num_envs = config.get('env', {}).get('num_envs', 2)
     print(f"🚀 Creating training VecEnv (num_envs = {num_envs}) ...")
 
     # 使用新的包装器避免 VecEnv 兼容性问题

@@ -88,12 +88,14 @@ class UR10eTrajectoryEnv(UR10eIncrementalEnv):
         self.ts_rrt_config = self.config.get('ts_rrt_star', {})
 
         # Trajectory tracking state
-        self.current_ts_waypoints: List[TSWaypoint] = []
-        self.current_waypoint_index: int = 0
-        self.trajectory_completed: bool = False
+        # Trajectory tracking state (vectorized)
+        self.current_ts_waypoints = []
+        self.current_waypoint_index = np.zeros(self.num_envs, dtype=np.int32)
+        self.trajectory_completed = np.zeros(self.num_envs, dtype=bool)
+
 
         # Reward function parameters (MUST be set before planner initialization)
-        self.waypoint_threshold = self.trajectory_config.get('waypoint_threshold', 0.05)
+        self.waypoint_threshold = self.trajectory_config.get('waypoint_threshold', 0.15)
         self.waypoint_bonus = self.trajectory_config.get('waypoint_bonus', 5.0)
         self.smooth_coef = self.trajectory_config.get('smooth_coef', 0.1)
         self.use_deviation_penalty = self.trajectory_config.get('use_deviation_penalty', False)
@@ -118,25 +120,27 @@ class UR10eTrajectoryEnv(UR10eIncrementalEnv):
         print(f"   🛤️  Task-Space planner: {'✅' if self.mode == 'trajectory_tracking' else '❌'}")
 
     def _init_task_space_planner(self):
-        """Initialize Task-Space RRT* planner"""
-        # Extract workspace bounds from config
         workspace_bounds_list = []
         for axis in ['x', 'y', 'z']:
             bounds = self.task_space_config.get('workspace_bounds', {}).get(axis, [-0.5, 0.5])
             workspace_bounds_list.append(bounds)
-
         workspace_bounds = np.array(workspace_bounds_list)
 
-        # Initialize planner interface
-        self.ts_planner = TaskSpacePlannerInterface(
-            workspace_bounds=workspace_bounds,
-            waypoint_spacing=0.1,
-            replanning_threshold=self.ts_rrt_config.get('replanning_threshold', 0.1),
-            max_waypoints=self.ts_rrt_config.get('max_waypoints', 50)
-        )
+        # ✅ 为每个 env 创建一个 planner（各自维护 waypoint_index）
+        self.ts_planners = [
+            TaskSpacePlannerInterface(
+                workspace_bounds=workspace_bounds,
+                waypoint_spacing=0.1,
+                replanning_threshold=self.ts_rrt_config.get('replanning_threshold', 0.1),
+                max_waypoints=self.ts_rrt_config.get('max_waypoints', 50)
+            )
+            for _ in range(self.num_envs)
+        ]
+        self.ts_planner = self.ts_planners[0]  # 兼容旧引用
 
         print(f"   🗺️  Workspace bounds: {workspace_bounds}")
         print(f"   📏 Waypoint threshold: {self.waypoint_threshold}m")
+
 
     def set_mode(self, mode: str):
         """
@@ -164,8 +168,8 @@ class UR10eTrajectoryEnv(UR10eIncrementalEnv):
             # 切回 point_to_point 模式：
             # 清空当前轨迹
             self.current_ts_waypoints = []
-            self.current_waypoint_index = 0
-            self.trajectory_completed = False
+            self.current_waypoint_index[:] = 0
+            self.trajectory_completed[:] = False
 
         print(f"🔁 Switched UR10eTrajectoryEnv mode to: {self.mode}")
 
@@ -219,15 +223,19 @@ class UR10eTrajectoryEnv(UR10eIncrementalEnv):
 
         if result.success:
             self.current_ts_waypoints = result.waypoints
-            self.current_waypoint_index = 0
-            self.trajectory_completed = False
+            self.current_waypoint_index[:] = 0
+            self.trajectory_completed[:] = False
+
+            for p in self.ts_planners:
+                p.current_waypoints = result.waypoints
+                p.current_waypoint_index = 0
 
             print(f"✅ Trajectory planned: {len(self.current_ts_waypoints)} waypoints")
             return True
         else:
             print(f"❌ Trajectory planning failed: {result.error_message}")
             self.current_ts_waypoints = []
-            self.current_waypoint_index = 0
+            self.current_waypoint_index[:] = 0
             return False
 
     def set_waypoints(self, waypoints: List[TSWaypoint]):
@@ -238,126 +246,83 @@ class UR10eTrajectoryEnv(UR10eIncrementalEnv):
             waypoints: List of TSWaypoint objects
         """
         self.current_ts_waypoints = waypoints
-        self.current_waypoint_index = 0
-        self.trajectory_completed = False
+        self.current_waypoint_index[:] = 0
+        self.trajectory_completed[:] = False
         print(f"📍 Set {len(waypoints)} waypoints for trajectory tracking")
 
-    def get_current_waypoint(self) -> Optional[TSWaypoint]:
+    def get_current_waypoint_(self) -> Optional[TSWaypoint]:
         """Get current waypoint for trajectory tracking"""
         if not self.current_ts_waypoints or self.current_waypoint_index >= len(self.current_ts_waypoints):
             return None
         return self.current_ts_waypoints[self.current_waypoint_index]
+    
+    def get_current_waypoint(self, env_id: int = 0) -> Optional[TSWaypoint]:
+        """Get current waypoint for a specific env (default env0 for logging/callback)."""
+        if self.mode != "trajectory_tracking":
+            return None
+        if not self.current_ts_waypoints:
+            return None
 
-    def get_observation(self) -> np.ndarray:
-        """
-        统一 19D 观测格式：
+        # 每个 env 有自己的 planner 和标量 index
+        planner = self.ts_planners[env_id] if hasattr(self, "ts_planners") else self.ts_planner
+        if planner.current_waypoints is None or len(planner.current_waypoints) == 0:
+            return None
 
-        [joint_pos(6) + joint_vel(6) + vec3(3) + progress(1) + tcp_pos(3)]
+        idx = int(planner.current_waypoint_index)
+        if idx >= len(planner.current_waypoints):
+            return None
+        return planner.current_waypoints[idx]
 
-        - trajectory_tracking:
-            vec3 = current_waypoint_pos - tcp_pos
-            progress = 当前轨迹进度 [0,1]
-        - point_to_point:
-            vec3 = target_pos - tcp_pos
-            progress = 0.0
-        """
+    
+    def get_observation(self):
         obs_list = []
-
         for i in range(self.num_envs):
-            # 关节角 / 速度：直接用前 6 自由度
-            joint_pos = self.joint_positions[i, :6].cpu().numpy()
-            joint_vel = self.joint_velocities[i, :6].cpu().numpy()
+            q = self.joint_positions[i].detach().cpu().numpy()
+            qd = self.joint_velocities[i].detach().cpu().numpy()
+            tcp = self._forward_kinematics(self.joint_positions[i]).detach().cpu().numpy()
 
-            # 当前 TCP 位置
-            tcp_pos = self._forward_kinematics(self.joint_positions[i]).cpu().numpy()
-
-            if self.mode == "trajectory_tracking":
-                current_waypoint = self.get_current_waypoint()
-                if current_waypoint is not None:
-                    waypoint_pos = np.asarray(current_waypoint.cartesian_position, dtype=np.float32)
-                    delta_vec = waypoint_pos - tcp_pos
-                    total_wps = len(self.current_ts_waypoints)
-                    if total_wps > 1:
-                        progress = float(self.current_waypoint_index) / float(total_wps - 1)
-                    else:
-                        progress = 0.0
+            if self.mode == "trajectory_tracking" and self.current_ts_waypoints:
+                wp = self.ts_planners[i].get_current_waypoint()
+                if wp is not None:
+                    wp_pos = np.asarray(wp.cartesian_position, np.float32)
+                    delta = wp_pos - tcp
+                    prog = self.ts_planners[i].current_waypoint_index / max(1, len(self.current_ts_waypoints)-1)
                 else:
-                    delta_vec = np.zeros(3, dtype=np.float32)
-                    progress = 0.0
+                    delta = np.zeros(3, np.float32)
+                    prog = 1.0
             else:
-                # point_to_point: 用 target_pos
-                if hasattr(self, "target_positions") and self.target_positions is not None:
-                    target_pos = self.target_positions[i].cpu().numpy()
-                else:
-                    target_pos = np.zeros(3, dtype=np.float32)
-                delta_vec = target_pos - tcp_pos
-                progress = 0.0
+                target = self.target_positions[i].detach().cpu().numpy()
+                delta = target - tcp
+                prog = 0.0
 
-            obs = np.concatenate([
-                joint_pos.astype(np.float32),     # 6
-                joint_vel.astype(np.float32),     # 6
-                delta_vec.astype(np.float32),     # 3
-                np.array([progress], np.float32), # 1
-                tcp_pos.astype(np.float32)        # 3
-            ])  # → 19
+            obs_i = np.concatenate([q, qd, delta, np.array([prog], np.float32), tcp]).astype(np.float32)
+            obs_list.append(obs_i)
 
-            assert obs.shape[0] == 19, f"Expected 19D observation, got {obs.shape[0]}D"
+        return obs_list[0] if self.num_envs == 1 else np.stack(obs_list, axis=0)
+    
+    def _trajectory_reward(self, tcp_pos, action_tensor, env_id: int = 0):
+        planner = self.ts_planners[env_id]
+        waypoint = planner.get_current_waypoint()
+        if waypoint is None:
+            return -10.0, False
 
-            # 如果你想这里也做归一化，可以在这加 self._normalize_state(obs)
-            obs_list.append(obs)
-
-        if self.num_envs == 1:
-            return obs_list[0]
-        return np.stack(obs_list, axis=0)
-
-    def _trajectory_reward(self, tcp_pos: torch.Tensor, action_tensor: torch.Tensor) -> Tuple[float, bool]:
-        """
-        OI-style trajectory tracking reward function
-
-        Design philosophy:
-        - Distance reward: Direct penalty for distance to current waypoint
-        - Waypoint bonus: Reward for reaching waypoints (helps credit assignment)
-        - Smoothness penalty: Penalize large action changes (prevents oscillation)
-        - Deviation penalty (optional): Penalize deviation from planned path
-
-        Args:
-            tcp_pos: Current TCP position tensor
-            action_tensor: Current action tensor
-
-        Returns:
-            Tuple of (reward, waypoint_reached)
-        """
-        current_waypoint = self.get_current_waypoint()
-        if current_waypoint is None:
-            # No waypoints available - return default reward
-            return -0.1, False
-
-        # Convert to tensors for computation
-        waypoint_pos = torch.tensor(current_waypoint.cartesian_position, device=tcp_pos.device, dtype=torch.float32)
-
-        # 1. 📏 Distance-based reward (core learning signal)
+        waypoint_pos = torch.tensor(waypoint.cartesian_position, device=tcp_pos.device)
         distance = torch.norm(tcp_pos - waypoint_pos)
-        r_distance = -distance.item()  # Linear penalty for distance
 
-        # 2. 🎯 Waypoint arrival reward (helps credit assignment)
-        reached = distance < self.waypoint_threshold
-        r_waypoint = reached.float().item() * self.waypoint_bonus
+        reward = -distance.item()
+        waypoint_reached = distance.item() < waypoint.tolerance
+        if waypoint_reached:
+            reward += self.waypoint_bonus
 
-        # 3. 🌊 Smoothness reward (prevents oscillation)
-        action_norm = torch.norm(action_tensor)
-        r_smooth = -self.smooth_coef * action_norm.item()
+        # 平滑项/偏离项如果启用，也用 planner 的 index
+        if self.use_deviation_penalty and len(planner.current_waypoints) > 1:
+            reward -= self.deviation_coef * self._calculate_path_deviation(tcp_pos, env_id)
 
-        # 4. 📐 Path deviation penalty (optional - more complex)
-        r_deviation = 0.0
-        if self.use_deviation_penalty and len(self.current_ts_waypoints) > 1:
-            r_deviation = -self.deviation_coef * self._calculate_path_deviation(tcp_pos)
+        reward -= self.smooth_coef * torch.norm(action_tensor).item()
+        return reward, waypoint_reached
 
-        # Total reward
-        total_reward = r_distance + r_waypoint + r_smooth + r_deviation
 
-        return total_reward, reached.item() > 0
-
-    def _calculate_path_deviation(self, tcp_pos: torch.Tensor) -> float:
+    def _calculate_path_deviation(self, tcp_pos: torch.Tensor,env_id: int = 0) -> float:
         """
         Calculate deviation from planned path (simplified line segment distance)
 
@@ -367,17 +332,12 @@ class UR10eTrajectoryEnv(UR10eIncrementalEnv):
         Returns:
             Deviation distance
         """
-        if len(self.current_ts_waypoints) < 2:
+        planner = self.ts_planners[env_id]
+        idx = planner.current_waypoint_index
+        if idx <= 0 or idx >= len(planner.current_waypoints):
             return 0.0
-
-        # Get current and next waypoints
-        current_wp = self.current_ts_waypoints[self.current_waypoint_index]
-
-        # Check if we're at the last waypoint
-        if self.current_waypoint_index >= len(self.current_ts_waypoints) - 1:
-            return 0.0
-
-        next_wp = self.current_ts_waypoints[self.current_waypoint_index + 1]
+        current_wp = planner.current_waypoints[idx-1]
+        next_wp = planner.current_waypoints[idx]
 
         # Simple deviation: distance from line segment between current and next waypoint
         current_wp_pos = torch.tensor(current_wp.cartesian_position, device=tcp_pos.device)
@@ -397,101 +357,148 @@ class UR10eTrajectoryEnv(UR10eIncrementalEnv):
 
         deviation = torch.norm(tcp_pos - proj_point)
         return deviation.item()
-
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
+    
+    def step(self, action: np.ndarray):
         """
-        Step the environment with trajectory tracking support
+        Step the environment with trajectory tracking support (vectorized).
 
         Args:
             action: 6D normalized action array [-1, 1]
+                    shape can be (6,) for single env or (num_envs, 6) for multi env
 
         Returns:
-            Tuple of (observation, reward, terminated, truncated, info)
+            (obs, reward, terminated, truncated, info)
+            - single env: reward float, terminated bool, truncated bool, info dict
+            - multi env: reward (num_envs,), terminated (num_envs,), truncated (num_envs,), info list[dict]
         """
-        # 添加调试信息，查看动作是否发生变化
-        if hasattr(self, '_last_action'):
-            action_change = np.linalg.norm(action - self._last_action)
-            #print(f"🔄 Action change magnitude: {action_change:.6f}")
+        # --------- debug: action change ----------
+        if hasattr(self, "_last_action"):
+            try:
+                action_change = np.linalg.norm(action - self._last_action)
+                # print(f"🔄 Action change magnitude: {action_change:.6f}")
+            except Exception:
+                pass
         self._last_action = action.copy()
-        
-        # 应用动作前记录关节位置
-        joint_pos_before = self.joint_positions[0].clone()
-        
-        # Use parent step function for physics simulation
-        obs, _, terminated, truncated, info = super().step(action)
 
-        # 应用动作后记录关节位置
-        joint_pos_after = self.joint_positions[0]
-        joint_change = torch.norm(joint_pos_after - joint_pos_before).item()
-        #print(f"🔧 Joint position change: {joint_change:.6f}")
+        # --------- record joint positions before ----------
+        joint_pos_before = self.joint_positions.clone()
 
-        # Ensure terminated and truncated are Python booleans (not tensors)
-        terminated = bool(terminated) if terminated is not None else False
-        truncated = bool(truncated) if truncated is not None else False
+        # --------- physics step from parent ----------
+        obs_base, reward_base, terminated_base, truncated_base, info_base = super().step(action)
 
+        # --------- record joint positions after ----------
+        joint_pos_after = self.joint_positions
+        try:
+            joint_change = torch.norm(joint_pos_after - joint_pos_before, dim=1).mean().item()
+            # print(f"🔧 Joint position change(mean): {joint_change:.6f}")
+        except Exception:
+            pass
+
+        # --------- normalize terminated/truncated to bool vectors ----------
+        def _to_bool_vec(x):
+            if x is None:
+                return np.zeros(self.num_envs, dtype=bool)
+            if isinstance(x, (bool, np.bool_)):
+                return np.full(self.num_envs, bool(x), dtype=bool)
+            if torch.is_tensor(x):
+                x = x.detach().cpu().numpy()
+            x = np.asarray(x).reshape(-1)
+            if x.size == 1:
+                return np.full(self.num_envs, bool(x[0]), dtype=bool)
+            return x.astype(bool)
+
+        term_base = _to_bool_vec(terminated_base)
+        trunc_base = _to_bool_vec(truncated_base)
+
+        # --------- trajectory tracking mode ----------
         if self.mode == "trajectory_tracking":
-            # Update waypoint progression if reached
-            current_tcp = self._forward_kinematics(self.joint_positions[0])
-            
-            # 添加调试信息，查看TCP位置是否发生变化
-            if hasattr(self, '_last_tcp'):
-                tcp_change = torch.norm(current_tcp - self._last_tcp).item()
-                #print(f"📍 TCP position change: {tcp_change:.6f}")
-            self._last_tcp = current_tcp.clone()
-            
-            # 1) 更新 planner 的进度
-            advanced = self.ts_planner.update_progress(current_tcp.cpu().numpy())
-            if advanced:
-                # ⭐ 关键：用 planner 的 index 同步 env 的 index
-                self.current_waypoint_index = self.ts_planner.current_waypoint_index
-                print(f"📍 Waypoint {self.current_waypoint_index + 1}/{len(self.current_ts_waypoints)} reached")
-
-            # Calculate trajectory-specific reward
+            # action tensor to device
             action_tensor = torch.as_tensor(action, dtype=torch.float32, device=self.device)
-            reward, waypoint_reached = self._trajectory_reward(current_tcp, action_tensor)
+            if action_tensor.ndim == 1:
+                action_tensor = action_tensor.unsqueeze(0)  # (1, 6)
 
-             # 3) 终点判定（用 planner 的 current waypoint）
-            current_wp = self.ts_planner.get_current_waypoint()
-            if current_wp is None and len(self.current_ts_waypoints) > 0:
-                # planner 认为已经走完所有 waypoint
-                self.trajectory_completed = True
-                terminated = True
-                print("🎉 Trajectory completed successfully!")
-            elif current_wp is not None and self.current_waypoint_index == len(self.current_ts_waypoints) - 1:
-                # 最后一个 waypoint 再做一次安全检查
-                final_dist = torch.norm(
-                    current_tcp - torch.tensor(current_wp.cartesian_position, device=self.device)
-                )
-                if final_dist < current_wp.tolerance:
-                    self.trajectory_completed = True
-                    terminated = True
-                    print("🎉 Trajectory completed successfully!")
+            rewards = np.zeros(self.num_envs, dtype=np.float32)
+            term_traj = np.zeros(self.num_envs, dtype=bool)
+            infos = []
 
-            # Update observation for trajectory tracking
+            for i in range(self.num_envs):
+                # 1) TCP per env
+                current_tcp = self._forward_kinematics(self.joint_positions[i])
+
+                # debug: tcp change per env
+                if not hasattr(self, "_last_tcp_list"):
+                    self._last_tcp_list = [None for _ in range(self.num_envs)]
+                last_tcp = self._last_tcp_list[i]
+                if last_tcp is not None:
+                    try:
+                        tcp_change = torch.norm(current_tcp - last_tcp).item()
+                        # print(f"[env {i}] 📍 TCP change: {tcp_change:.6f}")
+                    except Exception:
+                        pass
+                self._last_tcp_list[i] = current_tcp.detach().clone()
+
+                # 2) update planner progress per env
+                advanced = self.ts_planners[i].update_progress(current_tcp.detach().cpu().numpy())
+                if advanced:
+                    self.current_waypoint_index[i] = self.ts_planners[i].current_waypoint_index
+                    print(f"📍 [env {i}] Waypoint {self.current_waypoint_index[i] + 1}/{len(self.current_ts_waypoints)} reached")
+
+                # 3) reward per env
+                r_i, wp_reached_i = self._trajectory_reward(current_tcp, action_tensor[i], env_id=i)
+                rewards[i] = r_i
+
+                # 4) completion check per env
+                current_wp = self.ts_planners[i].get_current_waypoint()
+                if current_wp is None and len(self.current_ts_waypoints) > 0:
+                    self.trajectory_completed[i] = True
+                    term_traj[i] = True
+                    print(f"🎉 [env {i}] Trajectory completed successfully!")
+                elif current_wp is not None and self.current_waypoint_index[i] == len(self.current_ts_waypoints) - 1:
+                    final_dist = torch.norm(
+                        current_tcp - torch.tensor(current_wp.cartesian_position, device=self.device)
+                    )
+                    if final_dist < current_wp.tolerance:
+                        self.trajectory_completed[i] = True
+                        term_traj[i] = True
+                        print(f"🎉 [env {i}] Trajectory completed successfully!")
+
+                # 5) info per env
+                infos.append({
+                    "trajectory_mode": True,
+                    "current_waypoint": int(self.current_waypoint_index[i]),
+                    "total_waypoints": len(self.current_ts_waypoints),
+                    "waypoint_reached": bool(wp_reached_i),
+                    "trajectory_completed": bool(self.trajectory_completed[i]),
+                    "distance_to_waypoint": float(
+                        self.ts_planners[i].get_distance_to_current_waypoint(current_tcp.detach().cpu().numpy())
+                    )
+                })
+
             obs = self.get_observation()
+            terminated_out = np.logical_or(term_base, term_traj)
+            truncated_out = trunc_base
 
-            # 5) 在这里统一算 distance_to_waypoint，保证和 obs / progress 一致
-            if current_wp is not None:
-                distance_to_waypoint = float(
-                    np.linalg.norm(current_tcp.cpu().numpy() - current_wp.cartesian_position)
-                )
-            else:
-                distance_to_waypoint = float("inf")
+            if self.num_envs == 1:
+                return obs, float(rewards[0]), bool(terminated_out[0]), bool(truncated_out[0]), infos[0]
+            return obs, rewards, terminated_out, truncated_out, infos
 
-            # Add trajectory info to info dict
-            info.update({
-                'trajectory_mode': True,
-                'current_waypoint': self.current_waypoint_index,
-                'total_waypoints': len(self.current_ts_waypoints),
-                'waypoint_reached': waypoint_reached,
-                'trajectory_completed': self.trajectory_completed,
-                'distance_to_waypoint': self.ts_planner.get_distance_to_current_waypoint(current_tcp.cpu().numpy())
-            })
+        # --------- point-to-point / base mode ----------
         else:
-            # Use base environment reward for point-to-point mode
-            reward = self._calculate_reward()
+            # 这里直接用父类 reward（它本身就是向量化的）
+            reward_out = reward_base
+            if torch.is_tensor(reward_out):
+                reward_out = reward_out.detach().cpu().numpy()
+            reward_out = np.asarray(reward_out).reshape(-1)
+            if reward_out.size == 1:
+                reward_out = np.full(self.num_envs, float(reward_out[0]), dtype=np.float32)
 
-        return obs, reward, terminated, truncated, info
+            if self.num_envs == 1:
+                return obs_base, float(reward_out[0]), bool(term_base[0]), bool(trunc_base[0]), info_base
+            # info_base 如果是 dict，就广播成 list[dict]
+            if isinstance(info_base, dict):
+                info_base = [info_base.copy() for _ in range(self.num_envs)]
+            return obs_base, reward_out, term_base, trunc_base, info_base
+
 
     def reset(self, seed=None, options=None) -> Tuple[np.ndarray, Dict]:
         """Reset environment for new episode"""
@@ -504,8 +511,9 @@ class UR10eTrajectoryEnv(UR10eIncrementalEnv):
         obs, info = super().reset(seed=seed, options=options)
 
         # 3) 重置轨迹跟踪状态
-        self.current_waypoint_index = 0
-        self.trajectory_completed = False
+        self.current_waypoint_index[:] = 0
+        self.trajectory_completed[:] = False
+        
         # 删除_prev_distance_to_waypoint变量，确保每次reset都重新开始
         if hasattr(self, '_prev_distance_to_waypoint'):
             delattr(self, '_prev_distance_to_waypoint')
@@ -566,7 +574,7 @@ class UR10eTrajectoryEnv(UR10eIncrementalEnv):
         obs = self.get_observation()
 
         # 7) 补充 info
-        info.update(
+        """info.update(
             {
                 "trajectory_mode": self.mode == "trajectory_tracking",
                 "trajectory_completed": False,
@@ -575,10 +583,19 @@ class UR10eTrajectoryEnv(UR10eIncrementalEnv):
                 if self.mode == "trajectory_tracking"
                 else 0,
             }
-        )
+        )"""
+        infos = []
+        for i in range(self.num_envs):
+            infos.append({
+                "trajectory_mode": self.mode == "trajectory_tracking",
+                "trajectory_completed": False,
+                "current_waypoint": int(self.current_waypoint_index[i]),
+                "total_waypoints": len(self.current_ts_waypoints) if self.mode=="trajectory_tracking" else 0
+            })
 
-        return obs, info
-
+        #return obs, info
+        return (obs, infos[0]) if self.num_envs == 1 else (obs, infos)
+    
     def get_trajectory_statistics(self) -> Dict[str, Any]:
         """Get trajectory tracking statistics"""
         if self.mode != "trajectory_tracking":

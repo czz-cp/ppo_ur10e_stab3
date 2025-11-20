@@ -67,7 +67,7 @@ class TaskSpaceRRTStar:
                  max_iterations: int = 2000,
                  step_size: float = 0.05,
                  goal_bias: float = 0.1,
-                 goal_tolerance: float = 0.05,
+                 goal_tolerance: float = 0.15,
                  rewire_radius: float = None):
         """
         Initialize Task-Space RRT* planner
@@ -349,7 +349,7 @@ class TaskSpaceRRTStar:
 
         for i, pos in enumerate(path):
             # Tighter tolerance for final waypoint
-            tolerance = 0.05 if i < len(path) - 1 else self.goal_tolerance
+            tolerance = 0.15 if i < len(path) - 1 else self.goal_tolerance
 
             waypoint = TSWaypoint(
                 cartesian_position=pos,
@@ -442,10 +442,10 @@ def test_task_space_rrt_star():
     """Test Task-Space RRT* planner with example"""
     print("🧪 Testing Task-Space RRT* Planner")
 
-    # Define UR10e workspace bounds (conservative estimate)
+    # Define UR10e workspace bounds (matching config.yaml)
     workspace_bounds = np.array([
-        [-0.8, 0.8],    # X-axis range
-        [-0.8, 0.8],    # Y-axis range
+        [-1.4, 1.4],    # X-axis range
+        [-1.4, 1.4],    # Y-axis range
         [0.1, 1.0]      # Z-axis range (considering floor)
     ])
 

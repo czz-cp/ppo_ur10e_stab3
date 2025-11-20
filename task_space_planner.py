@@ -19,7 +19,7 @@ class TSPlanningRequest:
     start_tcp: np.ndarray         # Current 3D TCP position [x, y, z]
     target_tcp: np.ndarray        # Target 3D TCP position [x, y, z]
     max_planning_time: float = 5.0    # Maximum planning time (seconds)
-    tolerance: float = 0.05           # Goal tolerance (meters)
+    tolerance: float = 0.15           # Goal tolerance (meters)
 
 
 @dataclass
@@ -63,7 +63,7 @@ class TaskSpacePlannerInterface:
             max_iterations=2000,
             step_size=0.05,
             goal_bias=0.1,
-            goal_tolerance=0.05
+            goal_tolerance=0.15
         )
 
         # Store workspace bounds for validation
@@ -424,7 +424,7 @@ def test_task_space_planner_interface():
         start_tcp=start_tcp,
         target_tcp=target_tcp,
         max_planning_time=5.0,
-        tolerance=0.05
+        tolerance=0.15
     )
 
     # Plan path

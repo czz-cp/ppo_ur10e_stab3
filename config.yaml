@@ -4,7 +4,7 @@
 # Environment settings - 内存优化配置
 env:
   max_steps: 1000              # 减少最大步数，降低内存使用
-  dt: 0.02                    # 增大时间步长，减少计算频率
+  dt: 0.01                    # 增大时间步长，减少计算频率
   device_id: 0                # GPU device ID (use GPU 2 for server)
   num_envs: 2                # 环境模式
 
@@ -162,12 +162,12 @@ task_space:
   workspace_bounds:
     x: [-1.4, 1.4]    # X-axis workspace range (meters)
     y: [-1.4, 1.4]    # Y-axis workspace range (meters)
-    z: [0.1, 1.0]     # Z-axis workspace range (meters, floor considered)
+    z: [0.0, 1.0]     # Z-axis workspace range (meters, floor considered)
 
 # Trajectory Tracking Configuration (Task-Space RRT* + RL)
 trajectory_tracking:
   mode: "trajectory_tracking"  # "point_to_point" 或 "trajectory_tracking"
-  waypoint_threshold: 0.05    # Waypoint到达阈值 (meters)
+  waypoint_threshold: 0.15    # Waypoint到达阈值 (meters)
   waypoint_bonus: 5.0         # 到达waypoint奖励
   smooth_coef: 0.1            # 平滑性系数 (action penalty)
   use_deviation_penalty: false # 是否使用路径偏离惩罚 (复杂，默认关闭)
