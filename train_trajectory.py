@@ -18,6 +18,7 @@ import os
 import sys
 import time
 from typing import Dict, Optional
+import numpy as np
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Isaac Gym 必须在 torch 之前导入
@@ -225,6 +226,8 @@ class IsaacGymTrajectoryVecEnv(VecEnv):
     def step_wait(self):
         obs, reward, terminated, truncated, info = self.underlying_env.step(self._actions)
 
+       
+        
         # Convert to numpy
         obs_np = self._to_numpy(obs)
         rew_np = self._to_numpy(reward).flatten()
@@ -237,6 +240,42 @@ class IsaacGymTrajectoryVecEnv(VecEnv):
             infos = [info.copy() for _ in range(self.num_envs)]
         else:
             infos = info if info is not None else [{}] * self.num_envs
+        
+          # ⭐ Debug：打印 reward 和 distance_to_waypoint
+        if not hasattr(self, "_debug_step"):
+            self._debug_step = 0
+        self._debug_step += 1
+
+        if self._debug_step % 200 == 0:
+            
+
+            # 奖励统计
+            r_mean = float(np.mean(rew_np))
+            r_max = float(np.max(rew_np))
+            r_min = float(np.min(rew_np))
+
+            # 距离统计（有可能 info 里暂时没这个 key）
+            dists = []
+            for inf in infos:
+                if isinstance(inf, dict) and "distance_to_waypoint" in inf:
+                    dists.append(inf["distance_to_waypoint"])
+
+            if dists:
+                dists = np.array(dists, dtype=np.float32)
+                d_mean = float(dists.mean())
+                d_max = float(dists.max())
+                d_min = float(dists.min())
+                print(
+                    f"[VecEnv step {self._debug_step}] "
+                    f"reward mean = {r_mean:.3f}, max = {r_max:.3f}, min = {r_min:.3f} | "
+                    f"dist_to_wp mean = {d_mean:.3f}, max = {d_max:.3f}, min = {d_min:.3f}"
+                )
+            else:
+                print(
+                    f"[VecEnv step {self._debug_step}] "
+                    f"reward mean = {r_mean:.3f}, max = {r_max:.3f}, min = {r_min:.3f} | "
+                    f"dist_to_wp: (no key in info)"
+                )
 
         self._observations = obs_np
         return obs_np, rew_np, dones, infos
@@ -396,6 +435,30 @@ def train_trajectory_tracker(config_path: str = "config.yaml"):
 
                 print(f"📈 Progress: {progress:.1f}% | Steps: {self.num_timesteps:,}/{total_timesteps:,} | "
                       f"Speed: {steps_per_sec:.1f} steps/s | ETA: {eta/60:.1f} min")
+
+                # 添加更详细的训练统计信息
+                if hasattr(self.model, 'env') and hasattr(self.model.env, 'underlying_env'):
+                    # 获取环境中的信息
+                    env = self.model.env.underlying_env
+                    if hasattr(env, 'current_waypoint_index') and hasattr(env, 'current_ts_waypoints'):
+                        if len(env.current_ts_waypoints) > 0:
+                            current_wp = env.current_waypoint_index + 1
+                            total_wp = len(env.current_ts_waypoints)
+                            print(f"📍 Waypoint Progress: {current_wp}/{total_wp}")
+                            
+                            # 计算当前TCP到路径点的距离
+                            if hasattr(env, 'joint_positions') and len(env.joint_positions) > 0:
+                                tcp_pos = env._forward_kinematics(env.joint_positions[0])
+                                current_waypoint = env.get_current_waypoint()
+                                if current_waypoint is not None:
+                                    waypoint_pos = torch.tensor(current_waypoint.cartesian_position, 
+                                                              device=tcp_pos.device, dtype=tcp_pos.dtype)
+                                    distance = torch.norm(tcp_pos - waypoint_pos).item()
+                                    print(f"📏 Distance to Current Waypoint: {distance:.4f}m")
+                                    
+                                    # 显示TCP位置和路径点位置
+                                    print(f"🤖 Current TCP Position: [{tcp_pos[0]:.4f}, {tcp_pos[1]:.4f}, {tcp_pos[2]:.4f}]")
+                                    print(f"🚩 Current Waypoint Position: [{waypoint_pos[0]:.4f}, {waypoint_pos[1]:.4f}, {waypoint_pos[2]:.4f}]")
 
                 self.last_log_time = current_time
                 self.last_log_steps = self.num_timesteps

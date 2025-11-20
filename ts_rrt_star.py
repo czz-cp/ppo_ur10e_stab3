@@ -31,6 +31,17 @@ class TSNode:
     def __post_init__(self):
         if self.children is None:
             self.children = []
+    
+    def __eq__(self, other):
+        """Override equality comparison to use object identity"""
+        if not isinstance(other, TSNode):
+            return False
+        return id(self) == id(other)  # Compare by object identity, not position
+    
+    def __hash__(self):
+        """Override hash to use object identity"""
+        return id(self)
+
 
 
 @dataclass
@@ -309,14 +320,17 @@ class TaskSpaceRRTStar:
                     new_cost = new_node.cost + np.linalg.norm(new_node.position - node.position)
 
                     if new_cost < node.cost:
-                        # Rewire
-                        if node.parent:
-                            node.parent.children.remove(node)
+                        # Rewire - 安全地移除节点
+                        if node.parent and node in node.parent.children:
+                            # 使用索引安全移除
+                            for i, child in enumerate(node.parent.children):
+                                if id(child) == id(node):  # 明确的对象身份比较
+                                    del node.parent.children[i]
+                                    break
 
                         node.parent = new_node
                         node.cost = new_cost
                         new_node.children.append(node)
-
     def _extract_path(self, goal_node: TSNode) -> List[np.ndarray]:
         """Extract path from root to goal node"""
         path = []

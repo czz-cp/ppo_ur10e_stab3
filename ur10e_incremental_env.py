@@ -295,6 +295,7 @@ class UR10eIncrementalEnv(gym.Env):
         self.dt = self.config.get('env', {}).get('dt', 0.01)
 
         # UR10e joint limits and torque limits
+        self.torque_command_scale = 0.05  # Scale factor for torque commands
         self.ur10e_joint_limits = torch.tensor([
             [-2.0*np.pi, 2.0*np.pi],  # Shoulder pan
             [-np.pi, np.pi],          # Shoulder lift
@@ -380,7 +381,7 @@ class UR10eIncrementalEnv(gym.Env):
 
         # Observation Space: 18D - Complete state information for better learning
         # [joint_pos(6), joint_vel(6), target_pos(3), tcp_pos(3)] = 18D
-        obs_dim = 18  # Full state: joints + velocities + target + TCP position
+        obs_dim = 19  # Full state: joints + velocities + target + TCP position
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -426,8 +427,17 @@ class UR10eIncrementalEnv(gym.Env):
             self.tcp_pos_low = np.array([tcp_range['x'][0], tcp_range['y'][0], tcp_range['z'][0]])
             self.tcp_pos_high = np.array([tcp_range['x'][1], tcp_range['y'][1], tcp_range['z'][1]])
 
+            # 目标与 TCP 的相对位移 delta_to_target
+            # 这里假设工作空间在 [-2,2]m 内，足够大即可
+            self.delta_low  = -2.0 * np.ones(3, dtype=np.float32)
+            self.delta_high =  2.0 * np.ones(3, dtype=np.float32)
+
+            # progress（占位，0~1）
+            self.progress_low  = np.array([0.0], dtype=np.float32)
+            self.progress_high = np.array([1.0], dtype=np.float32)
+
             # Concatenated normalization ranges for all 18 dimensions
-            self.state_low = np.concatenate([
+            """self.state_low = np.concatenate([
                 self.joint_pos_low,    # 6D joint positions
                 self.joint_vel_low,    # 6D joint velocities
                 self.target_pos_low,   # 3D target positions
@@ -439,7 +449,24 @@ class UR10eIncrementalEnv(gym.Env):
                 self.joint_vel_high,   # 6D joint velocities
                 self.target_pos_high,  # 3D target positions
                 self.tcp_pos_high      # 3D TCP positions
-            ])
+            ])"""
+
+            self.state_low = np.concatenate([
+                self.joint_pos_low,
+                self.joint_vel_low,
+                self.delta_low,
+                self.progress_low,
+                self.tcp_pos_low
+            ])  # shape (19,)
+
+            self.state_high = np.concatenate([
+                self.joint_pos_high,
+                self.joint_vel_high,
+                self.delta_high,
+                self.progress_high,
+                self.tcp_pos_high
+            ])  # shape (19,)
+
 
             # Avoid division by zero
             self.state_range = self.state_high - self.state_low
@@ -690,10 +717,14 @@ class UR10eIncrementalEnv(gym.Env):
 
         self.ur10e_states = gymtorch.wrap_tensor(dof_states).view(self.num_envs, -1, 2)  # [num_envs, num_dofs, 2] where 2 = [pos, vel]
 
+        # 如果想知道它在哪个 device，可以打印一下（调试用）
+        print(f"🔍 DOF state tensor device = {self.ur10e_states.device}")
+
+
         # Force Isaac Gym tensors to target device (following working implementation)
-        if self.device.type == 'cuda':
-            self.ur10e_states = self.ur10e_states.to(self.device)
-            print(f"🔧 Isaac Gym DOF states tensor moved to GPU {self.device.index}")
+        #if self.device.type == 'cuda':
+        #    self.ur10e_states = self.ur10e_states.to(self.device)
+        #    print(f"🔧 Isaac Gym DOF states tensor moved to GPU {self.device.index}")
 
         # Debug: Check how many DOFs we actually have
         self.num_dofs = self.ur10e_states.shape[1]
@@ -741,7 +772,7 @@ class UR10eIncrementalEnv(gym.Env):
         self.target_positions = torch.zeros(
             (self.num_envs, 3),
             dtype=torch.float32,
-            device=self.device
+            device=self.ur10e_states.device
         )
 
         for i in range(self.num_envs):
@@ -851,12 +882,15 @@ class UR10eIncrementalEnv(gym.Env):
         # 🆕 Momentum inhibition: 防止力矩无限累积，产生更平滑的控制
         # 使用动量衰减而非简单的累加
         momentum_decay = self.torque_momentum_decay
-        self.torques = self.torques * momentum_decay + scaled_action
+        #self.torques = self.torques * momentum_decay + scaled_action
+        max_torques = self.ur10e_torque_limits.to(self.device) * self.torque_command_scale  # 默认 0.3
+        scaled_action = action_tensor * max_torques
+        self.torques = scaled_action.clone()
 
         # 🆕 Velocity-dependent torque inhibition: 高速时自动减少力矩输出
         # 这可以防止高速运动时的振荡和失控
-        velocity_penalty = torch.sigmoid(-self.joint_velocities.abs() * self.velocity_penalty_strength)
-        self.torques *= velocity_penalty
+        #velocity_penalty = torch.sigmoid(-self.joint_velocities.abs() * self.velocity_penalty_strength)
+        #self.torques *= velocity_penalty
 
         # Handle different action/DOF sizes
         if scaled_action.shape[-1] == 6 and self.num_dofs > 6:
@@ -907,6 +941,13 @@ class UR10eIncrementalEnv(gym.Env):
 
         # Update states
         self._update_states()
+
+         # 🔍 Debug: 看看力矩和关节速度有没有起来
+        if self.current_step % 200 == 0:
+            with torch.no_grad():
+                tau_max = float(self.torques[0].abs().max().item())
+                vel_max = float(self.joint_velocities[0].abs().max().item())
+            print(f"🔧 Debug τ_max = {tau_max:.3f} N·m, qdot_max = {vel_max:.3f} rad/s")
 
         # Get observation, reward, done
         observation = self._get_observation()
@@ -969,15 +1010,23 @@ class UR10eIncrementalEnv(gym.Env):
             # Current TCP position (3D) - approximate using forward kinematics
             tcp_pos = self._forward_kinematics(self.joint_positions[i]).cpu().numpy()
 
+            # 与目标的偏差向量
+            delta_to_target = target_pos - tcp_pos    # (3,)
+            
+             # 这里没有轨迹概念，progress 占位为 0.0
+            progress = np.array([0.0], dtype=np.float32)
+
             # Combine: [joint_pos(6), joint_vel(6), target_pos(3), tcp_pos(3)] = 18D
             # Full state with complete position information for better learning
             obs = np.concatenate([
                 joint_pos,      # 6D: joint angles
-                joint_vel,      # 6D: joint velocities
-                target_pos,     # 3D: target position in world frame
+                joint_vel,        # 6D: joint velocities
+                delta_to_target,  # 3D: distance to target
+                progress,        # 1D: progress towards target (placeholder)
                 tcp_pos         # 3D: current TCP position (total 18D)
             ])
 
+            assert obs.shape[0] == 19, f"Expected 19D obs, got {obs.shape[0]}D"
             # 🎯 Apply state normalization
             obs_normalized = self._normalize_state(obs)
             obs_list.append(obs_normalized)

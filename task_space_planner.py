@@ -233,7 +233,15 @@ class TaskSpacePlannerInterface:
         Returns:
             True if advanced to next waypoint
         """
-        if self.check_waypoint_reached(current_tcp):
+        # 添加调试信息
+        waypoint_reached = self.check_waypoint_reached(current_tcp)
+        if waypoint_reached:
+            print(f"🎯 Waypoint reached! Current TCP: [{current_tcp[0]:.4f}, {current_tcp[1]:.4f}, {current_tcp[2]:.4f}]")
+            waypoint = self.get_current_waypoint()
+            if waypoint:
+                print(f"🚩 Target Waypoint: [{waypoint.cartesian_position[0]:.4f}, {waypoint.cartesian_position[1]:.4f}, {waypoint.cartesian_position[2]:.4f}], Tolerance: {waypoint.tolerance:.4f}")
+        
+        if waypoint_reached:
             return self.advance_to_next_waypoint()
         return False
 
