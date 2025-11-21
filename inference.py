@@ -1,361 +1,228 @@
-"""
-UR10e PPO Inference with Stable-Baselines3
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 
-Inference script for testing trained models with pure RL control.
-Supports visualization and performance analysis.
+"""
+eval_trajectory.py
+验证/评估训练好的 UR10e 轨迹跟踪 PPO 模型
+
+用法：
+python eval_trajectory.py \
+    --model ./logs/trajectory_training_xxx/trajectory_model_final.zip \
+    --config config.yaml \
+    --episodes 20 \
+    --max_steps 600 \
+    --deterministic
+
+说明：
+- 每个 episode：
+  1) reset 到 point_to_point 模式（避免 reset() 自动规划覆盖）
+  2) 取当前 TCP 作 start
+  3) 随机采样 goal
+  4) 切回 trajectory_tracking 并 plan_trajectory(start, goal)
+  5) 用模型 deterministic / stochastic 推理执行
+- 输出成功率、平均回报、平均步数、最终距离等
 """
 
 import os
 import sys
-import time
 import argparse
+import time
 import numpy as np
-import matplotlib.pyplot as plt
-from typing import List, Dict, Any
 
-# Set up environment variables for GPU 2 (server compatibility)
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+# ---------------- Isaac Gym 必须早于 torch ----------------
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+try:
+    from isaacgym import gymapi, gymtorch, gymutil
+    from isaacgym.torch_utils import *  # noqa
+    print("✅ Isaac Gym imported successfully in eval_trajectory.py")
+except Exception as e:
+    print(f"❌ Failed to import Isaac Gym in eval_trajectory.py: {e}")
+    sys.exit(1)
 
-# Stable-Baselines3 imports
+import torch
+import yaml
 from stable_baselines3 import PPO
 
-# Import our custom environment
-from ur10e_incremental_env import UR10eIncrementalEnv
+from ur10e_trajectory_env import UR10eTrajectoryEnv
 
 
-class UR10eInference:
-    """UR10e PPO inference class for model testing and visualization"""
-
-    def __init__(self, model_path: str, config_path: str = "config.yaml"):
-        """
-        Initialize inference
-
-        Args:
-            model_path: Path to trained model (.zip file)
-            config_path: Path to configuration file
-        """
-        self.model_path = model_path
-        self.config_path = config_path
-
-        # Load model
-        print(f"🤖 Loading model from {model_path}...")
-        self.model = PPO.load(model_path)
-        print("✅ Model loaded successfully")
-
-        # Create environment
-        print(f"🏗️  Creating environment...")
-        self.env = UR10eIncrementalEnv(config_path=config_path, num_envs=1)
-        print("✅ Environment created")
-
-        # Initialize tracking variables
-        self.episode_rewards = []
-        self.episode_distances = []
-        self.episode_lengths = []
-        self.success_episodes = 0
-        self.total_episodes = 0
-
-    def run_episode(self, render: bool = False, max_steps: int = None) -> Dict[str, Any]:
-        """
-        Run a single episode
-
-        Args:
-            render: Whether to render the episode
-            max_steps: Maximum steps per episode (overrides config)
-
-        Returns:
-            Dictionary with episode statistics
-        """
-        obs, info = self.env.reset()
-        done = False
-        truncated = False
-
-        episode_reward = 0
-        episode_steps = 0
-        episode_distances = []
-        episode_torques = []
-
-        # Override max steps if specified
-        if max_steps:
-            original_max_steps = self.env.max_steps
-            self.env.max_steps = max_steps
-
-        while not done and not truncated:
-            # Get action from model
-            action, _ = self.model.predict(obs, deterministic=True)
-
-            # Step environment
-            obs, reward, terminated, truncated, info = self.env.step(action)
-
-            # Track statistics
-            episode_reward += reward
-            episode_steps += 1
-            episode_distances.append(info.get('distance', 1.0))
-            episode_torques.append(info.get('torques', np.zeros(6)))
-
-            done = terminated
-            truncated = truncated
-
-            # Optional rendering (simplified console output)
-            if render and episode_steps % 50 == 0:
-                print(f"   Step {episode_steps}: Reward={reward:.4f}, Distance={episode_distances[-1]:.4f}")
-
-        # Restore original max steps
-        if max_steps:
-            self.env.max_steps = original_max_steps
-
-        # Calculate episode statistics
-        final_distance = episode_distances[-1] if episode_distances else 1.0
-        success = final_distance < self.env.config.get('reward', {}).get('success_threshold', 0.05)
-
-        episode_stats = {
-            'reward': episode_reward,
-            'length': episode_steps,
-            'final_distance': final_distance,
-            'success': success,
-            'mean_distance': np.mean(episode_distances),
-            'distance_progress': episode_distances,
-            'torques': np.array(episode_torques),
-            'mean_torque': np.mean(np.abs(episode_torques)),
-            'max_torque': np.max(np.abs(episode_torques))
-        }
-
-        return episode_stats
-
-    def evaluate(self, num_episodes: int = 100, render: bool = False) -> Dict[str, Any]:
-        """
-        Evaluate model over multiple episodes
-
-        Args:
-            num_episodes: Number of evaluation episodes
-            render: Whether to render episodes
-
-        Returns:
-            Dictionary with evaluation statistics
-        """
-        print(f"\n🧪 Evaluating model over {num_episodes} episodes...")
-
-        episode_stats = []
-
-        for episode in range(num_episodes):
-            if render:
-                print(f"\n🎬 Episode {episode + 1}/{num_episodes}")
-
-            stats = self.run_episode(render=render)
-            episode_stats.append(stats)
-
-            # Update global tracking
-            self.episode_rewards.append(stats['reward'])
-            self.episode_distances.append(stats['final_distance'])
-            self.episode_lengths.append(stats['length'])
-
-            if stats['success']:
-                self.success_episodes += 1
-            self.total_episodes += 1
-
-            # Print progress
-            if (episode + 1) % 10 == 0:
-                recent_success_rate = np.mean([s['success'] for s in episode_stats[-10:]]) * 100
-                recent_reward = np.mean([s['reward'] for s in episode_stats[-10:]])
-                print(f"   Episodes {episode-9}-{episode}: Success Rate={recent_success_rate:.1f}%, Reward={recent_reward:.4f}")
-
-        # Calculate overall statistics
-        rewards = [s['reward'] for s in episode_stats]
-        distances = [s['final_distance'] for s in episode_stats]
-        lengths = [s['length'] for s in episode_stats]
-        successes = [s['success'] for s in episode_stats]
-
-        evaluation_stats = {
-            'total_episodes': num_episodes,
-            'success_rate': np.mean(successes) * 100,
-            'mean_reward': np.mean(rewards),
-            'std_reward': np.std(rewards),
-            'mean_distance': np.mean(distances),
-            'std_distance': np.std(distances),
-            'mean_length': np.mean(lengths),
-            'std_length': np.std(lengths),
-            'min_reward': np.min(rewards),
-            'max_reward': np.max(rewards),
-            'best_episode_idx': np.argmax(rewards),
-            'worst_episode_idx': np.argmin(rewards)
-        }
-
-        return evaluation_stats
-
-    def print_evaluation_summary(self, stats: Dict[str, Any]):
-        """Print evaluation summary"""
-        print(f"\n📊 Evaluation Summary:")
-        print(f"   Episodes: {stats['total_episodes']}")
-        print(f"   Success Rate: {stats['success_rate']:.1f}%")
-        print(f"   Reward: {stats['mean_reward']:.4f} ± {stats['std_reward']:.4f}")
-        print(f"   Distance: {stats['mean_distance']:.4f} ± {stats['std_distance']:.4f}")
-        print(f"   Episode Length: {stats['mean_length']:.1f} ± {stats['std_length']:.1f}")
-        print(f"   Best Episode: #{stats['best_episode_idx'] + 1} (Reward: {stats['max_reward']:.4f})")
-        print(f"   Worst Episode: #{stats['worst_episode_idx'] + 1} (Reward: {stats['min_reward']:.4f})")
-
-    def plot_training_progress(self, save_path: str = None):
-        """Plot training progress"""
-        if not self.episode_rewards:
-            print("⚠️ No episode data to plot")
-            return
-
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-        fig.suptitle('UR10e PPO Inference Performance', fontsize=16)
-
-        # Plot 1: Episode Rewards
-        axes[0, 0].plot(self.episode_rewards)
-        axes[0, 0].set_title('Episode Rewards')
-        axes[0, 0].set_xlabel('Episode')
-        axes[0, 0].set_ylabel('Reward')
-        axes[0, 0].grid(True)
-
-        # Add moving average
-        if len(self.episode_rewards) > 10:
-            window_size = min(10, len(self.episode_rewards) // 4)
-            moving_avg = np.convolve(self.episode_rewards, np.ones(window_size)/window_size, mode='valid')
-            axes[0, 0].plot(range(window_size-1, len(self.episode_rewards)), moving_avg, 'r-', linewidth=2, label=f'MA({window_size})')
-            axes[0, 0].legend()
-
-        # Plot 2: Success Rate
-        if len(self.episode_rewards) > 0:
-            success_window = 10
-            success_rates = []
-            for i in range(len(self.episode_rewards)):
-                start_idx = max(0, i - success_window + 1)
-                successes = sum(1 for j in range(start_idx, i + 1) if self.episode_distances[j] < 0.05)
-                success_rates.append(successes / (i - start_idx + 1) * 100)
-
-            axes[0, 1].plot(success_rates)
-            axes[0, 1].set_title('Rolling Success Rate')
-            axes[0, 1].set_xlabel('Episode')
-            axes[0, 1].set_ylabel('Success Rate (%)')
-            axes[0, 1].grid(True)
-            axes[0, 1].axhline(y=50, color='r', linestyle='--', alpha=0.7, label='50%')
-            axes[0, 1].legend()
-
-        # Plot 3: Final Distances
-        axes[1, 0].plot(self.episode_distances)
-        axes[1, 0].set_title('Final Distances to Target')
-        axes[1, 0].set_xlabel('Episode')
-        axes[1, 0].set_ylabel('Distance (m)')
-        axes[1, 0].grid(True)
-        axes[1, 0].axhline(y=0.05, color='r', linestyle='--', alpha=0.7, label='Success Threshold')
-        axes[1, 0].legend()
-
-        # Plot 4: Episode Lengths
-        axes[1, 1].plot(self.episode_lengths)
-        axes[1, 1].set_title('Episode Lengths')
-        axes[1, 1].set_xlabel('Episode')
-        axes[1, 1].set_ylabel('Steps')
-        axes[1, 1].grid(True)
-
-        plt.tight_layout()
-
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"📊 Plot saved to {save_path}")
-        else:
-            plt.show()
-
-    def analyze_best_episode(self, num_test_episodes: int = 100):
-        """Analyze the best episode from recent test"""
-        print(f"\n🔍 Analyzing best episode from {num_test_episodes} test episodes...")
-
-        best_stats = None
-        best_reward = -np.inf
-
-        for episode in range(num_test_episodes):
-            stats = self.run_episode(render=False)
-            if stats['reward'] > best_reward:
-                best_reward = stats['reward']
-                best_stats = stats
-
-        if best_stats:
-            print(f"\n🏆 Best Episode Analysis:")
-            print(f"   Reward: {best_stats['reward']:.4f}")
-            print(f"   Length: {best_stats['length']} steps")
-            print(f"   Final Distance: {best_stats['final_distance']:.4f}m")
-            print(f"   Success: {best_stats['success']}")
-            print(f"   Mean Torque: {best_stats['mean_torque']:.2f} N⋅m")
-            print(f"   Max Torque: {best_stats['max_torque']:.2f} N⋅m")
-
-            # Plot distance progress
-            plt.figure(figsize=(10, 6))
-            plt.plot(best_stats['distance_progress'])
-            plt.title(f'Best Episode: Distance Progress Over Time (Reward: {best_stats["reward"]:.4f})')
-            plt.xlabel('Step')
-            plt.ylabel('Distance to Target (m)')
-            plt.grid(True)
-            plt.axhline(y=0.05, color='r', linestyle='--', alpha=0.7, label='Success Threshold')
-            plt.legend()
-            plt.show()
-
-    def close(self):
-        """Close environment"""
-        if hasattr(self, 'env'):
-            self.env.close()
-        print("✅ Inference environment closed")
-
-
-def main():
-    parser = argparse.ArgumentParser(description='UR10e PPO Inference')
-    parser.add_argument('--model', type=str, required=True,
-                        help='Path to trained model (.zip file)')
-    parser.add_argument('--config', type=str, default='config.yaml',
-                        help='Path to configuration file')
-    parser.add_argument('--episodes', type=int, default=50,
-                        help='Number of evaluation episodes')
-    parser.add_argument('--render', action='store_true',
-                        help='Render episodes during evaluation')
-    parser.add_argument('--plot', action='store_true',
-                        help='Plot training progress')
-    parser.add_argument('--analyze-best', action='store_true',
-                        help='Analyze best episode in detail')
-    parser.add_argument('--save-plot', type=str, default=None,
-                        help='Path to save performance plot')
-
-    args = parser.parse_args()
-
-    print("🚀 Starting UR10e PPO Inference")
-    print("=" * 50)
-
-    # Check if model exists
-    if not os.path.exists(args.model):
-        print(f"❌ Model file {args.model} not found")
+def load_config(config_path: str):
+    try:
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)
+        print(f"✅ Config loaded: {config_path}")
+        return cfg
+    except FileNotFoundError:
+        print(f"❌ Config not found: {config_path}")
         sys.exit(1)
 
-    # Initialize inference
-    inference = UR10eInference(model_path=args.model, config_path=args.config)
 
-    try:
-        # Run evaluation
-        stats = inference.evaluate(num_episodes=args.episodes, render=args.render)
+def sample_goal_from_config(cfg):
+    ws_cfg = cfg.get("task_space", {}).get("workspace_bounds", {})
+    def _axis(name, default):
+        return ws_cfg.get(name, default)
 
-        # Print summary
-        inference.print_evaluation_summary(stats)
+    goal = np.array(
+        [
+            np.random.uniform(*_axis("x", [-0.6, 0.6])),
+            np.random.uniform(*_axis("y", [-0.6, 0.6])),
+            np.random.uniform(*_axis("z", [0.2, 0.8])),
+        ],
+        dtype=np.float32,
+    )
+    return goal
 
-        # Plot progress if requested
-        if args.plot:
-            inference.plot_training_progress(save_path=args.save_plot)
 
-        # Analyze best episode if requested
-        if args.analyze_best:
-            inference.analyze_best_episode(num_test_episodes=min(20, args.episodes))
+@torch.no_grad()
+def get_current_tcp(env: UR10eTrajectoryEnv):
+    tcp = env._forward_kinematics(env.joint_positions[0]).detach().cpu().numpy()
+    return tcp.astype(np.float32)
 
-    except KeyboardInterrupt:
-        print("\n⏹️  Inference interrupted by user")
 
-    except Exception as e:
-        print(f"\n❌ Inference failed with error: {e}")
-        import traceback
-        traceback.print_exc()
+def evaluate(model_path: str,
+             config_path: str,
+             episodes: int = 10,
+             max_steps: int = 500,
+             deterministic: bool = True,
+             seed: int = 0):
 
-    finally:
-        # Close environment
-        inference.close()
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-    print(f"\n🎉 Inference completed!")
+    cfg = load_config(config_path)
+
+    # 评估只开 1 个 env 最稳
+    env = UR10eTrajectoryEnv(config_path=config_path, num_envs=1, mode="point_to_point")
+
+    # load 模型（绑定 env 以保证 action/obs space 一致）
+    model = PPO.load(model_path, env=env)
+    print(f"✅ Model loaded: {model_path}")
+
+    success_list = []
+    reward_list = []
+    steps_list = []
+    final_dist_list = []
+
+    for ep in range(1, episodes + 1):
+        print(f"\n================ Episode {ep}/{episodes} ================")
+
+        # 1) reset 到 point_to_point 模式，避免 reset() 自动规划覆盖
+        obs, info = env.reset(options={"mode": "point_to_point"})
+
+        # 2) 当前 TCP 作为 start
+        start_tcp = get_current_tcp(env)
+
+        # 3) 随机采样 goal
+        goal_tcp = sample_goal_from_config(cfg)
+
+        # 4) 切回 trajectory_tracking 并规划
+        env.set_mode("trajectory_tracking")
+        ok = env.plan_trajectory(start_tcp, goal_tcp)
+        if not ok:
+            print("❌ Planning failed, skip this episode.")
+            success_list.append(False)
+            reward_list.append(0.0)
+            steps_list.append(0)
+            final_dist_list.append(float("inf"))
+            continue
+
+        # 规划后重新取 obs（19D 带 delta_to_waypoint/progress）
+        obs = env.get_observation()
+
+        done = False
+        total_reward = 0.0
+        steps = 0
+
+        t0 = time.time()
+        while (not done) and steps < max_steps:
+            obs_np = np.asarray(obs, dtype=np.float32).reshape(1, -1)
+
+            if obs_np.ndim == 1:
+                obs_np = obs_np[None, :]   # (1, obs_dim)
+
+            action, _ = model.predict(obs_np, deterministic=deterministic)
+            action = np.asarray(action).reshape(-1)  # (6,)
+
+            obs, reward, terminated, truncated, info = env.step(action)
+
+            total_reward += float(reward)
+            done = bool(terminated or truncated)
+            steps += 1
+
+            if steps % 50 == 0:
+                dist = info.get("distance_to_waypoint", None)
+                print(f"[ep {ep}] step {steps:4d} | r_sum={total_reward:8.3f} | "
+                      f"wp={info.get('current_waypoint', -1)}/{info.get('total_waypoints', -1)} | "
+                      f"dist={dist}")
+
+        dt = time.time() - t0
+
+        # 5) 统计
+        stats = env.get_trajectory_statistics()
+        traj_completed = stats.get("trajectory_completed", False)
+        if isinstance(traj_completed, (np.ndarray, list)):
+            traj_completed = bool(traj_completed[0])
+
+        # 最终距离：用 info 的 distance_to_waypoint（若已完成会接近 0），否则自己算到最后一个 wp
+        if isinstance(info, dict) and "distance_to_waypoint" in info:
+            final_dist = float(info["distance_to_waypoint"])
+        else:
+            final_tcp = get_current_tcp(env)
+            if env.current_ts_waypoints:
+                final_wp = env.current_ts_waypoints[-1].cartesian_position
+                final_dist = float(np.linalg.norm(final_tcp - final_wp))
+            else:
+                final_dist = float("inf")
+
+        print(f"Episode {ep} finished in {steps} steps, {dt:.2f}s")
+        print(f"  total_reward = {total_reward:.3f}")
+        print(f"  trajectory_completed = {traj_completed}")
+        print(f"  final_dist_to_goal = {final_dist:.4f} m")
+        print(f"  goal_tcp = {goal_tcp}")
+
+        success_list.append(traj_completed)
+        reward_list.append(total_reward)
+        steps_list.append(steps)
+        final_dist_list.append(final_dist)
+
+    env.close()
+
+    # 汇总
+    success_rate = np.mean(success_list) * 100.0
+    mean_reward = np.mean(reward_list)
+    mean_steps = np.mean(steps_list)
+    mean_final_dist = np.mean(final_dist_list)
+
+    print("\n================== Evaluation Summary ==================")
+    print(f"Episodes: {episodes}")
+    print(f"Success rate: {success_rate:.1f}% ({sum(success_list)}/{episodes})")
+    print(f"Mean total reward: {mean_reward:.3f}")
+    print(f"Mean steps: {mean_steps:.1f}")
+    print(f"Mean final dist: {mean_final_dist:.4f} m")
+    print("========================================================")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser("UR10e PPO Trajectory Model Evaluation")
+    parser.add_argument("--model", type=str, default= "models/trajectory_model_final.zip",
+                        help="path to SB3 PPO model .zip (e.g. trajectory_model_final.zip)")
+    parser.add_argument("--config", type=str, default="config.yaml",
+                        help="path to config.yaml")
+    parser.add_argument("--episodes", type=int, default=10,
+                        help="number of test episodes")
+    parser.add_argument("--max_steps", type=int, default=500,
+                        help="max steps per episode")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="use deterministic policy")
+    parser.add_argument("--seed", type=int, default=0)
+
+    args = parser.parse_args()
+
+    evaluate(
+        model_path=args.model,
+        config_path=args.config,
+        episodes=args.episodes,
+        max_steps=args.max_steps,
+        deterministic=args.deterministic,
+        seed=args.seed
+    )

@@ -304,22 +304,55 @@ class UR10eTrajectoryEnv(UR10eIncrementalEnv):
         planner = self.ts_planners[env_id]
         waypoint = planner.get_current_waypoint()
         if waypoint is None:
+            # 没有路径点，大概率是轨迹结束或者规划失败
             return -10.0, False
 
-        waypoint_pos = torch.tensor(waypoint.cartesian_position, device=tcp_pos.device)
-        distance = torch.norm(tcp_pos - waypoint_pos)
+        # 懒初始化：为每个 env 维护一个“上一时刻到当前 waypoint 的距离”
+        if not hasattr(self, "_prev_distance_to_waypoint"):
+            #import numpy as np
+            self._prev_distance_to_waypoint = np.full(self.num_envs, np.inf, dtype=np.float32)
 
-        reward = -distance.item()
-        waypoint_reached = distance.item() < waypoint.tolerance
+        waypoint_pos = torch.tensor(waypoint.cartesian_position, device=tcp_pos.device, dtype=tcp_pos.dtype)
+        distance = torch.norm(tcp_pos - waypoint_pos)
+        dist_val = float(distance.item())
+
+        # -------- 1) 距离惩罚 --------
+        # 可以在 config.yaml 的 trajectory 下面加 distance_weight / progress_weight
+        distance_weight = self.trajectory_config.get("distance_weight", 2.0)
+        reward = -distance_weight * dist_val
+
+        # -------- 2) 进步奖励：比上一帧更靠近当前 waypoint 就加分 --------
+        prev_dist = float(self._prev_distance_to_waypoint[env_id])
+        progress_reward = 0.0
+        if np.isfinite(prev_dist):
+            progress = prev_dist - dist_val   # 正数表示变近了
+            if progress > 0.0:
+                progress_weight = self.trajectory_config.get("progress_weight", 3.0)
+                progress_reward = progress_weight * progress
+                reward += progress_reward
+        # 如果是第一次调用（prev = inf），就不加进步项
+
+        # -------- 3) 到达当前 waypoint 的一次性奖励 --------
+        waypoint_reached = dist_val < waypoint.tolerance
         if waypoint_reached:
             reward += self.waypoint_bonus
+            # 重置 prev 距离，让下一个 waypoint 单独算进步
+            self._prev_distance_to_waypoint[env_id] = np.inf
+        else:
+            # 记录当前距离，供下一步计算进步
+            self._prev_distance_to_waypoint[env_id] = dist_val
 
-        # 平滑项/偏离项如果启用，也用 planner 的 index
+        # -------- 4) 偏离路径惩罚（可选） --------
         if self.use_deviation_penalty and len(planner.current_waypoints) > 1:
-            reward -= self.deviation_coef * self._calculate_path_deviation(tcp_pos, env_id)
+            deviation = self._calculate_path_deviation(tcp_pos, env_id)
+            reward -= self.deviation_coef * deviation
 
-        reward -= self.smooth_coef * torch.norm(action_tensor).item()
+        # -------- 5) 平滑惩罚：控制 torque 大小 --------
+        smooth_penalty = self.smooth_coef * torch.norm(action_tensor).item()
+        reward -= smooth_penalty
+
         return reward, waypoint_reached
+
 
 
     def _calculate_path_deviation(self, tcp_pos: torch.Tensor,env_id: int = 0) -> float:
@@ -594,6 +627,9 @@ class UR10eTrajectoryEnv(UR10eIncrementalEnv):
             })
 
         #return obs, info
+        # 在 reset() 里（规划成功后）初始化
+        #self._prev_distance_to_waypoint = np.full(self.num_envs, np.inf, dtype=np.float32)
+
         return (obs, infos[0]) if self.num_envs == 1 else (obs, infos)
     
     def get_trajectory_statistics(self) -> Dict[str, Any]:

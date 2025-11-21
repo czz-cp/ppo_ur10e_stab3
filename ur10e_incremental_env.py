@@ -337,7 +337,7 @@ class UR10eIncrementalEnv(gym.Env):
         ], device=self.device)
 
         # Safety parameters (must be set before defining spaces)
-        self.max_increment_torque = self.config.get('control', {}).get('max_increment_torque', 20.0)
+        self.max_increment_torque = self.config.get('control', {}).get('max_increment_torque', 100.0)
         self.emergency_stop_threshold = self.config.get('safety', {}).get('emergency_stop_threshold', 0.5)
 
         # 🆕 Momentum and control parameters
@@ -852,8 +852,12 @@ class UR10eIncrementalEnv(gym.Env):
         # Convert action to tensor
         action_tensor = torch.as_tensor(action, dtype=torch.float32, device=self.device)
 
+        # ✅ 关键修复：统一成 (batch, dof)
+        if action_tensor.ndim == 1:
+            action_tensor = action_tensor.unsqueeze(0)  # (1, num_dofs or 1)
+
         # Handle different action shapes from DummyVecEnv
-        if action_tensor.numel() == 1:
+        """if action_tensor.numel() == 1:
             # Single scalar action, expand to 6D
             action_tensor = action_tensor.repeat(6)
         elif action_tensor.shape[-1] != self.num_dofs:
@@ -864,7 +868,22 @@ class UR10eIncrementalEnv(gym.Env):
                 action_tensor = torch.cat([
                     action_tensor,
                     torch.zeros(self.num_dofs - action_tensor.numel(), device=self.device)
-                ])
+                ])"""
+        
+        # Handle different action shapes
+        if action_tensor.numel() == 1:
+            # scalar -> 6D
+            action_tensor = action_tensor.repeat(1, self.num_dofs)  # (1, num_dofs)
+        elif action_tensor.shape[-1] != self.num_dofs:
+            flat = action_tensor.view(-1)[:self.num_dofs]
+            if flat.numel() < self.num_dofs:
+                flat = torch.cat([flat,
+                                torch.zeros(self.num_dofs - flat.numel(), device=self.device)])
+            action_tensor = flat.unsqueeze(0)  # (1, num_dofs)
+
+        # ✅ 如果多环境但只给了一个动作，广播到 num_envs
+        if action_tensor.shape[0] == 1 and self.num_envs > 1:
+            action_tensor = action_tensor.repeat(self.num_envs, 1)
 
         # 🎯 Joint-specific action scaling (normalized action [-1,1] -> actual torque)
         # 基于关节力矩限制的归一化，使[-1,1]动作对应合适的增量力矩
@@ -882,9 +901,9 @@ class UR10eIncrementalEnv(gym.Env):
         # 🆕 Momentum inhibition: 防止力矩无限累积，产生更平滑的控制
         # 使用动量衰减而非简单的累加
         momentum_decay = self.torque_momentum_decay
-        #self.torques = self.torques * momentum_decay + scaled_action
-        max_torques = self.ur10e_torque_limits.to(self.device) * self.torque_command_scale  # 默认 0.3
-        scaled_action = action_tensor * max_torques
+        self.torques = self.torques * momentum_decay + scaled_action
+        #max_torques = self.ur10e_torque_limits.to(self.device) * self.torque_command_scale  # 默认 0.3
+        #scaled_action = action_tensor * max_torques
         self.torques = scaled_action.clone()
 
         # 🆕 Velocity-dependent torque inhibition: 高速时自动减少力矩输出
@@ -962,7 +981,7 @@ class UR10eIncrementalEnv(gym.Env):
         info = self._get_info()
 
         # 🛠️ 修复奖励归一化
-        if hasattr(self, 'reward_norm_enabled') and self.reward_norm_enabled:
+        """if hasattr(self, 'reward_norm_enabled') and self.reward_norm_enabled:
             if hasattr(self, 'reward_normalizers') and self.reward_normalizers is not None:
                 # 确保 reward 是标量
                 if isinstance(reward, (np.ndarray, torch.Tensor)):
@@ -978,7 +997,34 @@ class UR10eIncrementalEnv(gym.Env):
                 try:
                     self.reward_normalizers[0].update(reward_scalar, bool(terminated))
                 except (IndexError, AttributeError) as e:
+                    print(f"⚠️ Reward normalizer update failed: {e}")"""
+        # 🛠️ 修复奖励归一化（稳健版）
+        if hasattr(self, 'reward_norm_enabled') and self.reward_norm_enabled:
+            if hasattr(self, 'reward_normalizers') and self.reward_normalizers is not None:
+
+                def _reward_to_scalar(r):
+                    # torch tensor
+                    if torch.is_tensor(r):
+                        if r.ndim == 0:                 # 0-dim 标量
+                            return float(r.item())
+                        if r.numel() == 1:              # 1 个元素但有维度
+                            return float(r.view(-1)[0].item())
+                        return float(r.view(-1)[0].item())  # 多环境时取第一个
+
+                    # numpy / list / float
+                    r_np = np.asarray(r)
+                    if r_np.ndim == 0:                  # numpy 标量
+                        return float(r_np.item())
+                    return float(r_np.reshape(-1)[0])
+
+                reward_scalar = _reward_to_scalar(reward)
+
+                # 安全地更新归一化器
+                try:
+                    self.reward_normalizers[0].update(reward_scalar, bool(terminated))
+                except (IndexError, AttributeError) as e:
                     print(f"⚠️ Reward normalizer update failed: {e}")
+
 
 
          # 检查输出

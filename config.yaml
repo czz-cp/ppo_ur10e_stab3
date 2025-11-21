@@ -10,7 +10,7 @@ env:
 
 # Control configuration (纯RL控制 - 方案A)
 control:
-  max_increment_torque: 20.0  # Maximum incremental torque per step (N⋅m)
+  max_increment_torque: 40.0  # Maximum incremental torque per step (N⋅m)
   torque_safety_factor: 0.8   # Safety factor for torque limits (80% of official)
   velocity_safety_factor: 0.8 # Safety factor for velocity limits (80% of official)
   control_frequency: 100      # Hz
@@ -109,7 +109,7 @@ ppo:
     log_std_init: -0.5         # Initial log standard deviation for actions
 
   # Learning parameters (optimized for pure RL control)
-  learning_rate: 1.0e-4        # Learning rate for both networks
+  learning_rate: 3.0e-4        # Learning rate for both networks
   n_steps: 2048                # Steps per update
   batch_size: 64               # Batch size for training
   n_epochs: 10                 # Number of optimization epochs per update
@@ -165,13 +165,18 @@ task_space:
     z: [0.0, 1.0]     # Z-axis workspace range (meters, floor considered)
 
 # Trajectory Tracking Configuration (Task-Space RRT* + RL)
+# rt​≈−αdt​+β(dt−1​−dt​)+​+bonus_hit_wp−λ∥at​∥
 trajectory_tracking:
   mode: "trajectory_tracking"  # "point_to_point" 或 "trajectory_tracking"
-  waypoint_threshold: 0.15    # Waypoint到达阈值 (meters)
-  waypoint_bonus: 5.0         # 到达waypoint奖励
-  smooth_coef: 0.1            # 平滑性系数 (action penalty)
+  waypoint_threshold: 0.2    # Waypoint到达阈值 (meters)
+  waypoint_bonus: 15.0         # 到达waypoint奖励
+  smooth_coef: 0.03            # 平滑性系数 (action penalty)
   use_deviation_penalty: false # 是否使用路径偏离惩罚 (复杂，默认关闭)
   deviation_coef: 2.0         # 路径偏离惩罚系数
+
+  # 新增两个参数
+  distance_weight: 2.0
+  progress_weight: 3.0
 
 # Task-Space RRT* Parameters
 ts_rrt_star:
@@ -179,7 +184,7 @@ ts_rrt_star:
   step_size: 0.05              # RRT*步长 (meters)
   goal_bias: 0.1               # 目标采样偏置
   rewire_radius: 0.15          # 重新布线半径 (meters)
-  max_waypoints: 50            # 最大路径点数量
+  max_waypoints: 20            # 最大路径点数量
   replanning_threshold: 0.1    # 重新规划阈值 (meters)
 
 # RRT* Global Planning Integration (legacy)
